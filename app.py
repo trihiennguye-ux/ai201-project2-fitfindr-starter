@@ -57,13 +57,12 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
         return session["error"], "", ""
     
     item = session["selected_item"]
-    item = session["selected_item"]
     listing_text = f"""**{item.get('title', 'Item')}**
 
-💰 **Price:** ${item.get('price', 'N/A')}
-🏪 **Platform:** {item.get('platform', 'Unknown').title()}
-📦 **Condition:** {item.get('condition', 'Unknown').title()}
-📏 **Size:** {item.get('size', 'N/A')}
+**Price:** ${item.get('price', 'N/A')}
+**Platform:** {item.get('platform', 'Unknown').title()}
+**Condition:** {item.get('condition', 'Unknown').title()}
+**Size:** {item.get('size', 'N/A')}
 
 **Colors:** {', '.join(item.get('colors', []))}
 **Category:** {item.get('category', 'Unknown').title()}

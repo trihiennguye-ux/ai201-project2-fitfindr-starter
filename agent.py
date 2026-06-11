@@ -19,6 +19,69 @@ Usage (once implemented):
 """
 
 from tools import search_listings, suggest_outfit, create_fit_card
+import re
+
+
+# ── query parsing ──────────────────────────────────────────────────────────────
+
+def parse_query(query: str) -> dict:
+    """
+    Extract description, size, and max_price from a natural language query.
+    
+    Uses regex patterns to find:
+    - Price: "under $30" or "$50" or "< $40" etc.
+    - Size: "size M" or "size S/M" or "small" etc.
+    - Description: everything else
+    
+    Returns dict with keys: description, size (or None), max_price (or None)
+    """
+    parsed = {
+        "description": query,
+        "size": None,
+        "max_price": None,
+    }
+    
+    # Extract price (look for dollar amounts with optional "under", "$", "less than")
+    price_patterns = [
+        r'under\s*\$?\s*(\d+(?:\.\d{2})?)',
+        r'\$\s*(\d+(?:\.\d{2})?)',
+        r'less than\s*\$?\s*(\d+(?:\.\d{2})?)',
+        r'budget\s*\$?\s*(\d+(?:\.\d{2})?)',
+    ]
+    for pattern in price_patterns:
+        match = re.search(pattern, query, re.IGNORECASE)
+        if match:
+            parsed["max_price"] = float(match.group(1))
+            break
+    
+    # Extract size (look for size specifications)
+    size_patterns = [
+        r'size\s+([XSMLXWXL0-9/-]+)',
+        r'\b([XSMLXWXL0-9/-]+)\s+(?:fit|fits)',
+    ]
+    for pattern in size_patterns:
+        match = re.search(pattern, query, re.IGNORECASE)
+        if match:
+            parsed["size"] = match.group(1).strip()
+            break
+    
+    # Extract description (remove price and size info)
+    description = query
+    # Remove price mentions
+    description = re.sub(r'under\s*\$?\s*\d+(?:\.\d{2})?', '', description, flags=re.IGNORECASE)
+    description = re.sub(r'\$\s*\d+(?:\.\d{2})?', '', description, flags=re.IGNORECASE)
+    description = re.sub(r'less than\s*\$?\s*\d+(?:\.\d{2})?', '', description, flags=re.IGNORECASE)
+    description = re.sub(r'budget\s*\$?\s*\d+(?:\.\d{2})?', '', description, flags=re.IGNORECASE)
+    
+    # Remove size mentions
+    description = re.sub(r'size\s+[XSMLXWXL0-9/-]+', '', description, flags=re.IGNORECASE)
+    description = re.sub(r'[XSMLXWXL0-9/-]+\s+(?:fit|fits)', '', description, flags=re.IGNORECASE)
+    
+    # Clean up whitespace
+    description = ' '.join(description.split()).strip()
+    parsed["description"] = description if description else "item"
+    
+    return parsed
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -92,9 +155,48 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    session["parsed"] = parse_query(query)
+
+    session["search_results"] = search_listings(
+        description=session["parsed"].get("description", ""),
+        size=session["parsed"].get("size"),
+        max_price=session["parsed"].get("max_price"),
+    )
+
+    if not session["search_results"]:
+        description = session["parsed"].get("description", "item")
+        max_price = session["parsed"].get("max_price")
+        price_str = f" under ${max_price}" if max_price else ""
+        session["error"] = (
+            f"No items found for '{description}'{price_str}. "
+            f"Try increasing your budget, removing size filters, or using different keywords "
+            f"(e.g., 'tee' instead of 't-shirt')."
+        )
+        return session
+    
+    session["selected_item"] = session["search_results"][0]
+
+    try:
+        session["outfit_suggestion"] = suggest_outfit(
+            new_item=session["selected_item"],
+            wardrobe=session["wardrobe"],
+        )
+    except Exception as e:
+        session["error"] = f"Error generating outfit suggestion: {str(e)}"
+        return session
+    
+    try:
+        session["fit_card"] = create_fit_card(
+            outfit=session["outfit_suggestion"],
+            new_item=session["selected_item"],
+        )
+    except Exception as e:
+        session["error"] = f"Error generating fit card: {str(e)}"
+        session["fit_card"] = None  # ensure fit_card is None if there's an error
+        return session
+
     return session
 
 

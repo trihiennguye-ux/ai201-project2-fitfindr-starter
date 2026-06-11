@@ -120,4 +120,4 @@ Describe what you're looking for — include size and price if you want to filte
 
 if __name__ == "__main__":
     demo = build_interface()
-    demo.launch()
+    demo.launch(share=True)

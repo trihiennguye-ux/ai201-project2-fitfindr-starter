@@ -18,7 +18,70 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
-from tools import search_listings, suggest_outfit, create_fit_card
+from tools import search_listings, suggest_outfit, create_fit_card, price_comparison, retry_search_with_fallback
+import re
+
+
+# ── query parsing ──────────────────────────────────────────────────────────────
+
+def parse_query(query: str) -> dict:
+    """
+    Extract description, size, and max_price from a natural language query.
+    
+    Uses regex patterns to find:
+    - Price: "under $30" or "$50" or "< $40" etc.
+    - Size: "size M" or "size S/M" or "small" etc.
+    - Description: everything else
+    
+    Returns dict with keys: description, size (or None), max_price (or None)
+    """
+    parsed = {
+        "description": query,
+        "size": None,
+        "max_price": None,
+    }
+    
+    # Extract price (look for dollar amounts with optional "under", "$", "less than")
+    price_patterns = [
+        r'under\s*\$?\s*(\d+(?:\.\d{2})?)',
+        r'\$\s*(\d+(?:\.\d{2})?)',
+        r'less than\s*\$?\s*(\d+(?:\.\d{2})?)',
+        r'budget\s*\$?\s*(\d+(?:\.\d{2})?)',
+    ]
+    for pattern in price_patterns:
+        match = re.search(pattern, query, re.IGNORECASE)
+        if match:
+            parsed["max_price"] = float(match.group(1))
+            break
+    
+    # Extract size (look for size specifications)
+    size_patterns = [
+        r'size\s+([XSMLXWXL0-9/-]+)',
+        r'\b([XSMLXWXL0-9/-]+)\s+(?:fit|fits)',
+    ]
+    for pattern in size_patterns:
+        match = re.search(pattern, query, re.IGNORECASE)
+        if match:
+            parsed["size"] = match.group(1).strip()
+            break
+    
+    # Extract description (remove price and size info)
+    description = query
+    # Remove price mentions
+    description = re.sub(r'under\s*\$?\s*\d+(?:\.\d{2})?', '', description, flags=re.IGNORECASE)
+    description = re.sub(r'\$\s*\d+(?:\.\d{2})?', '', description, flags=re.IGNORECASE)
+    description = re.sub(r'less than\s*\$?\s*\d+(?:\.\d{2})?', '', description, flags=re.IGNORECASE)
+    description = re.sub(r'budget\s*\$?\s*\d+(?:\.\d{2})?', '', description, flags=re.IGNORECASE)
+    
+    # Remove size mentions
+    description = re.sub(r'size\s+[XSMLXWXL0-9/-]+', '', description, flags=re.IGNORECASE)
+    description = re.sub(r'[XSMLXWXL0-9/-]+\s+(?:fit|fits)', '', description, flags=re.IGNORECASE)
+    
+    # Clean up whitespace
+    description = ' '.join(description.split()).strip()
+    parsed["description"] = description if description else "item"
+    
+    return parsed
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -37,8 +100,10 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "query": query,              # original user query
         "parsed": {},                # extracted description / size / max_price
         "search_results": [],        # list of matching listing dicts
+        "search_adjustments": [],    # list of constraints loosened during retry
         "selected_item": None,       # top result, passed into suggest_outfit
         "wardrobe": wardrobe,        # user's wardrobe dict
+        "price_assessment": None,    # dict from price_comparison (optional)
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
@@ -72,8 +137,9 @@ def run_agent(query: str, wardrobe: dict) -> dict:
                 to parse it — document your choice in planning.md.
                 Store the result in session["parsed"].
 
-        Step 3: Call search_listings() with the parsed parameters.
-                Store results in session["search_results"].
+        Step 3: Call retry_search_with_fallback() with the parsed parameters.
+                Store results in session["search_results"] and adjustments in
+                session["search_adjustments"].
                 If no results: set session["error"] to a helpful message and
                 return the session early. Do NOT proceed to suggest_outfit
                 with empty input.
@@ -81,20 +147,82 @@ def run_agent(query: str, wardrobe: dict) -> dict:
         Step 4: Select the item to use (e.g., the top result).
                 Store it in session["selected_item"].
 
-        Step 5: Call suggest_outfit() with the selected item and wardrobe.
+        Step 5 (optional): Call price_comparison() with the selected item.
+                Store the result in session["price_assessment"].
+                If this fails, continue anyway (non-blocking).
+
+        Step 6: Call suggest_outfit() with the selected item and wardrobe.
                 Store the result in session["outfit_suggestion"].
 
-        Step 6: Call create_fit_card() with the outfit suggestion and selected item.
+        Step 7: Call create_fit_card() with the outfit suggestion and selected item.
                 Store the result in session["fit_card"].
 
-        Step 7: Return the session.
+        Step 8: Return the session.
 
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    session["parsed"] = parse_query(query)
+
+    # Use retry_search_with_fallback instead of direct search_listings call
+    search_result = retry_search_with_fallback(
+        description=session["parsed"].get("description", ""),
+        size=session["parsed"].get("size"),
+        max_price=session["parsed"].get("max_price"),
+    )
+    
+    session["search_results"] = search_result["results"]
+    session["search_adjustments"] = search_result["adjustments_made"]
+
+    if not session["search_results"]:
+        description = session["parsed"].get("description", "item")
+        adjustments_text = ""
+        if session["search_adjustments"]:
+            # Format adjustments with proper grammar
+            adjustments_list = [adj.lower() for adj in session["search_adjustments"]]
+            if len(adjustments_list) == 1:
+                adjustments_text = f" Tried {adjustments_list[0]} but still no matches."
+            else:
+                adjustments_text = (
+                    f" Tried {', '.join(adjustments_list[:-1])} and {adjustments_list[-1]} but still no matches."
+                )
+        session["error"] = (
+            f"No items found for '{description}'.{adjustments_text} "
+            f"Try very different keywords (e.g., 'hoodie' instead of 'sweater') "
+            f"or check back later."
+        )
+        return session
+    
+    session["selected_item"] = session["search_results"][0]
+    
+    # Call price_comparison (optional, non-blocking)
+    try:
+        session["price_assessment"] = price_comparison(session["selected_item"])
+    except Exception as e:
+        print(f"[run_agent] Price comparison failed: {str(e)}")
+        session["price_assessment"] = None
+
+    try:
+        session["outfit_suggestion"] = suggest_outfit(
+            new_item=session["selected_item"],
+            wardrobe=session["wardrobe"],
+        )
+    except Exception as e:
+        session["error"] = f"Error generating outfit suggestion: {str(e)}"
+        return session
+    
+    try:
+        session["fit_card"] = create_fit_card(
+            outfit=session["outfit_suggestion"],
+            new_item=session["selected_item"],
+        )
+    except Exception as e:
+        session["error"] = f"Error generating fit card: {str(e)}"
+        session["fit_card"] = None  # ensure fit_card is None if there's an error
+        return session
+
     return session
 
 

@@ -69,8 +69,39 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    all_listing = load_listings()
+
+    filtered = all_listing
+    if max_price is not None:
+       filtered = [l for l in filtered if l.get("price", float("inf")) <= max_price]
+
+    if size is not None:
+        size_lower = size.lower()
+        filtered = [
+            l for l in filtered
+            if size_lower in l.get("size", "").lower()
+        ]
+
+    description_keywords = set(description.lower().split())
+    scored_listings = []
+
+    for listing in filtered:
+        searchable_text = " ".join([
+            listing.get("title", ""),
+            listing.get("description", ""),
+            " ".join(listing.get("style_tags", [])),
+            listing.get("category", ""),
+            listing.get("brand", "") or ""
+        ]).lower()
+        
+        searchable_keywords = set(searchable_text.split())
+        score = len(description_keywords & searchable_keywords)
+        
+        if score > 0:
+            scored_listings.append((score, listing))
+
+    scored_listings.sort(key=lambda x: x[0], reverse=True)
+    return [listing for _, listing in scored_listings]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +131,56 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    client = _get_groq_client()
+    
+    # Check if wardrobe is empty
+    wardrobe_items = wardrobe.get("items", [])
+    
+    if not wardrobe_items:
+        # Generate generic styling advice
+        prompt = f"""
+You are a fashion stylist. A user is considering buying this item:
+
+Item: {new_item.get('title', 'Item')}
+Colors: {', '.join(new_item.get('colors', []))}
+Style tags: {', '.join(new_item.get('style_tags', []))}
+Category: {new_item.get('category', '')}
+Description: {new_item.get('description', '')}
+
+The user's wardrobe is currently empty. Suggest general styling ideas for this item. What kinds of pieces pair well with it? What vibe does it suit? How could someone style it?
+
+Keep your response friendly, practical, and 2-3 sentences. End by inviting them to add items to their wardrobe for personalized suggestions.
+"""
+    else:
+        wardrobe_formatted = "\n".join([
+            f"- {item.get('name', 'Item')}: {item.get('colors', [])} | {item.get('style_tags', [])}"
+            for item in wardrobe_items
+        ])
+        
+        prompt = f"""
+You are a fashion stylist. A user is considering buying this new item:
+
+Item: {new_item.get('title', 'Item')}
+Colors: {', '.join(new_item.get('colors', []))}
+Style tags: {', '.join(new_item.get('style_tags', []))}
+Category: {new_item.get('category', '')}
+Description: {new_item.get('description', '')}
+
+Their current wardrobe includes:
+{wardrobe_formatted}
+
+Suggest 1-2 complete outfit combinations that pair this new item with specific pieces from their wardrobe. Be specific about which pieces go together and why. Mention the vibe or occasion.
+
+Keep your response 3-5 sentences and practical.
+"""
+    message = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=200,
+        temperature=0.7
+    )
+    
+    return message.choices[0].message.content.strip() # type: ignore
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +212,234 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    client = _get_groq_client()
+    if not outfit or not outfit.strip():
+        fallback = (
+            f"{new_item.get('title', 'Item')} from {new_item.get('platform', 'marketplace')} "
+            f"— ${new_item.get('price', 'price')}. {new_item.get('condition', 'condition').capitalize()}. "
+            f"Add to fit."
+        )
+        return fallback
+    
+    prompt = f"""
+Write a casual 2-4 sentence Instagram/TikTok OOTD caption for this thrifted fit. 
+It should feel authentic and fun, like a real post from someone excited about their outfit.
+
+Item being styled:
+- Title: {new_item.get('title', 'Item')}
+- Price: ${new_item.get('price', 'TBD')}
+- Platform: {new_item.get('platform', 'thrift')}
+- Condition: {new_item.get('condition', '')}
+
+Outfit & styling advice:
+{outfit}
+
+Guidelines:
+- Keep it casual and conversational
+- Mention the item name, price, and platform once each (weave them in naturally)
+- Capture the vibe in specific style terms
+- Feel free to use emojis if it fits the tone
+- Sound authentic, not like marketing copy
+
+Write only the caption text, no additional commentary.
+"""
+    message = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=150,
+        temperature=0.9
+    )
+    return message.choices[0].message.content.strip() # type: ignore
+
+
+# ── Tool 4: price_comparison ──────────────────────────────────────────────────
+
+def price_comparison(item: dict, listings: list[dict] | None = None) -> dict:
+    """
+    Estimate whether a thrifted item's price is fair by comparing against
+    similar items (same category and condition) in the dataset.
+
+    Args:
+        item:     A listing dict with keys: price, category, condition, style_tags
+        listings: Optional dataset to search for comparables. If None, loads all listings.
+
+    Returns:
+        A dict with:
+        - fairness_rating (str): one of "great_deal", "fair_price", or "overpriced"
+        - reasoning (str): 1–2 sentence explanation (empty if no comparables)
+        - comparable_items_count (int): number of similar items used for comparison
+        - price_range_low (float): estimated low price for similar items
+        - price_range_high (float): estimated high price for similar items
+
+    If no comparable items exist, returns neutral assessment with empty reasoning.
+    Never raises an exception.
+    """
+    try:
+        if listings is None:
+            listings = load_listings()
+        
+        item_price = item.get("price", 0)
+        item_category = item.get("category", "").lower()
+        item_condition = item.get("condition", "").lower()
+        
+        # Find comparable items: same category and condition
+        comparable = [
+            l for l in listings
+            if l.get("category", "").lower() == item_category
+            and l.get("condition", "").lower() == item_condition
+        ]
+        
+        if not comparable:
+            return {
+                "fairness_rating": "fair_price",
+                "reasoning": "",
+                "comparable_items_count": 0,
+                "price_range_low": 0.0,
+                "price_range_high": 0.0,
+            }
+        
+        # Calculate price distribution
+        prices = sorted([l.get("price", 0) for l in comparable])
+        count = len(prices)
+        
+        # Calculate quartiles
+        q1_idx = count // 4
+        q3_idx = (3 * count) // 4
+        
+        price_range_low = prices[0]
+        price_range_high = prices[-1]
+        q1 = prices[q1_idx] if q1_idx < count else prices[0]
+        q3 = prices[q3_idx] if q3_idx < count else prices[-1]
+        median = prices[count // 2] if count > 0 else 0
+        
+        # Determine fairness rating based on quartiles
+        if item_price <= q1:
+            fairness_rating = "great_deal"
+        elif item_price <= q3:
+            fairness_rating = "fair_price"
+        else:
+            fairness_rating = "overpriced"
+        
+        # Generate reasoning
+        if fairness_rating == "great_deal":
+            reasoning = (
+                f"Great deal! Similar {item_category} items in {item_condition} condition "
+                f"typically sell for ${q1:.2f}–${q3:.2f}, and this is priced at ${item_price:.2f}."
+            )
+        elif fairness_rating == "fair_price":
+            reasoning = (
+                f"Fair price. Similar {item_category} items in {item_condition} condition "
+                f"range from ${price_range_low:.2f} to ${price_range_high:.2f}, "
+                f"with this one at ${item_price:.2f}."
+            )
+        else:
+            reasoning = (
+                f"On the higher end. Similar {item_category} items in {item_condition} condition "
+                f"typically sell for ${q1:.2f}–${q3:.2f}, and this is priced at ${item_price:.2f}."
+            )
+        
+        return {
+            "fairness_rating": fairness_rating,
+            "reasoning": reasoning,
+            "comparable_items_count": count,
+            "price_range_low": price_range_low,
+            "price_range_high": price_range_high,
+        }
+    except Exception as e:
+        print(f"[price_comparison] Error: {str(e)}")
+        return {
+            "fairness_rating": "fair_price",
+            "reasoning": "",
+            "comparable_items_count": 0,
+            "price_range_low": 0.0,
+            "price_range_high": 0.0,
+        }
+
+
+# ── Tool 5: retry_search_with_fallback ────────────────────────────────────────
+
+def retry_search_with_fallback(
+    description: str,
+    size: str | None = None,
+    max_price: float | None = None,
+    price_tolerance: float = 0.20,
+) -> dict:
+    """
+    Wraps search_listings with intelligent retry logic. If the initial search
+    returns no results, automatically loosens constraints and retries:
+    1. Remove size filter, retry
+    2. Increase max_price by price_tolerance %, retry
+    3. Remove all constraints, retry once more
+
+    Args:
+        description (str): Item description
+        size (str | None): Desired size, or None to skip filtering
+        max_price (float | None): Max budget, or None to skip filtering
+        price_tolerance (float): Buffer for price relaxation (default 0.20 = 20%)
+
+    Returns:
+        A dict with:
+        - results (list[dict]): Matching listings (sorted by relevance), may be empty
+        - adjustments_made (list[str]): Human-readable descriptions of loosened constraints
+        - original_constraints (dict): The original {description, size, max_price}
+        - retry_count (int): Number of retries performed (0 = found on first try)
+
+    Never raises an exception.
+    """
+    adjustments_made = []
+    retry_count = 0
+    
+    original_constraints = {
+        "description": description,
+        "size": size,
+        "max_price": max_price,
+    }
+    
+    # Attempt 1: Original constraints
+    results = search_listings(description, size, max_price)
+    if results:
+        return {
+            "results": results,
+            "adjustments_made": adjustments_made,
+            "original_constraints": original_constraints,
+            "retry_count": retry_count,
+        }
+    
+    # Attempt 2: Remove size filter
+    if size is not None:
+        retry_count += 1
+        results = search_listings(description, None, max_price)
+        adjustments_made.append("Removed size filter")
+        if results:
+            return {
+                "results": results,
+                "adjustments_made": adjustments_made,
+                "original_constraints": original_constraints,
+                "retry_count": retry_count,
+            }
+    
+    # Attempt 3: Increase budget by price_tolerance %
+    if max_price is not None:
+        retry_count += 1
+        relaxed_price = max_price * (1 + price_tolerance)
+        results = search_listings(description, None, relaxed_price)
+        adjustments_made.append(f"Increased budget to ${relaxed_price:.2f}")
+        if results:
+            return {
+                "results": results,
+                "adjustments_made": adjustments_made,
+                "original_constraints": original_constraints,
+                "retry_count": retry_count,
+            }
+    
+    # Attempt 4: Remove all constraints
+    retry_count += 1
+    results = search_listings(description, None, None)
+    adjustments_made.append("Removed all constraints")
+    
+    return {
+        "results": results,
+        "adjustments_made": adjustments_made,
+        "original_constraints": original_constraints,
+        "retry_count": retry_count,
+    }

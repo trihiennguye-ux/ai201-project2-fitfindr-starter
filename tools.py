@@ -250,3 +250,196 @@ Write only the caption text, no additional commentary.
         temperature=0.9
     )
     return message.choices[0].message.content.strip() # type: ignore
+
+
+# ── Tool 4: price_comparison ──────────────────────────────────────────────────
+
+def price_comparison(item: dict, listings: list[dict] | None = None) -> dict:
+    """
+    Estimate whether a thrifted item's price is fair by comparing against
+    similar items (same category and condition) in the dataset.
+
+    Args:
+        item:     A listing dict with keys: price, category, condition, style_tags
+        listings: Optional dataset to search for comparables. If None, loads all listings.
+
+    Returns:
+        A dict with:
+        - fairness_rating (str): one of "great_deal", "fair_price", or "overpriced"
+        - reasoning (str): 1–2 sentence explanation (empty if no comparables)
+        - comparable_items_count (int): number of similar items used for comparison
+        - price_range_low (float): estimated low price for similar items
+        - price_range_high (float): estimated high price for similar items
+
+    If no comparable items exist, returns neutral assessment with empty reasoning.
+    Never raises an exception.
+    """
+    try:
+        if listings is None:
+            listings = load_listings()
+        
+        item_price = item.get("price", 0)
+        item_category = item.get("category", "").lower()
+        item_condition = item.get("condition", "").lower()
+        
+        # Find comparable items: same category and condition
+        comparable = [
+            l for l in listings
+            if l.get("category", "").lower() == item_category
+            and l.get("condition", "").lower() == item_condition
+        ]
+        
+        if not comparable:
+            return {
+                "fairness_rating": "fair_price",
+                "reasoning": "",
+                "comparable_items_count": 0,
+                "price_range_low": 0.0,
+                "price_range_high": 0.0,
+            }
+        
+        # Calculate price distribution
+        prices = sorted([l.get("price", 0) for l in comparable])
+        count = len(prices)
+        
+        # Calculate quartiles
+        q1_idx = count // 4
+        q3_idx = (3 * count) // 4
+        
+        price_range_low = prices[0]
+        price_range_high = prices[-1]
+        q1 = prices[q1_idx] if q1_idx < count else prices[0]
+        q3 = prices[q3_idx] if q3_idx < count else prices[-1]
+        median = prices[count // 2] if count > 0 else 0
+        
+        # Determine fairness rating based on quartiles
+        if item_price <= q1:
+            fairness_rating = "great_deal"
+        elif item_price <= q3:
+            fairness_rating = "fair_price"
+        else:
+            fairness_rating = "overpriced"
+        
+        # Generate reasoning
+        if fairness_rating == "great_deal":
+            reasoning = (
+                f"Great deal! Similar {item_category} items in {item_condition} condition "
+                f"typically sell for ${q1:.2f}–${q3:.2f}, and this is priced at ${item_price:.2f}."
+            )
+        elif fairness_rating == "fair_price":
+            reasoning = (
+                f"Fair price. Similar {item_category} items in {item_condition} condition "
+                f"range from ${price_range_low:.2f} to ${price_range_high:.2f}, "
+                f"with this one at ${item_price:.2f}."
+            )
+        else:
+            reasoning = (
+                f"On the higher end. Similar {item_category} items in {item_condition} condition "
+                f"typically sell for ${q1:.2f}–${q3:.2f}, and this is priced at ${item_price:.2f}."
+            )
+        
+        return {
+            "fairness_rating": fairness_rating,
+            "reasoning": reasoning,
+            "comparable_items_count": count,
+            "price_range_low": price_range_low,
+            "price_range_high": price_range_high,
+        }
+    except Exception as e:
+        print(f"[price_comparison] Error: {str(e)}")
+        return {
+            "fairness_rating": "fair_price",
+            "reasoning": "",
+            "comparable_items_count": 0,
+            "price_range_low": 0.0,
+            "price_range_high": 0.0,
+        }
+
+
+# ── Tool 5: retry_search_with_fallback ────────────────────────────────────────
+
+def retry_search_with_fallback(
+    description: str,
+    size: str | None = None,
+    max_price: float | None = None,
+    price_tolerance: float = 0.20,
+) -> dict:
+    """
+    Wraps search_listings with intelligent retry logic. If the initial search
+    returns no results, automatically loosens constraints and retries:
+    1. Remove size filter, retry
+    2. Increase max_price by price_tolerance %, retry
+    3. Remove all constraints, retry once more
+
+    Args:
+        description (str): Item description
+        size (str | None): Desired size, or None to skip filtering
+        max_price (float | None): Max budget, or None to skip filtering
+        price_tolerance (float): Buffer for price relaxation (default 0.20 = 20%)
+
+    Returns:
+        A dict with:
+        - results (list[dict]): Matching listings (sorted by relevance), may be empty
+        - adjustments_made (list[str]): Human-readable descriptions of loosened constraints
+        - original_constraints (dict): The original {description, size, max_price}
+        - retry_count (int): Number of retries performed (0 = found on first try)
+
+    Never raises an exception.
+    """
+    adjustments_made = []
+    retry_count = 0
+    
+    original_constraints = {
+        "description": description,
+        "size": size,
+        "max_price": max_price,
+    }
+    
+    # Attempt 1: Original constraints
+    results = search_listings(description, size, max_price)
+    if results:
+        return {
+            "results": results,
+            "adjustments_made": adjustments_made,
+            "original_constraints": original_constraints,
+            "retry_count": retry_count,
+        }
+    
+    # Attempt 2: Remove size filter
+    if size is not None:
+        retry_count += 1
+        results = search_listings(description, None, max_price)
+        adjustments_made.append("Removed size filter")
+        if results:
+            return {
+                "results": results,
+                "adjustments_made": adjustments_made,
+                "original_constraints": original_constraints,
+                "retry_count": retry_count,
+            }
+    
+    # Attempt 3: Increase budget by price_tolerance %
+    if max_price is not None:
+        retry_count += 1
+        relaxed_price = max_price * (1 + price_tolerance)
+        results = search_listings(description, None, relaxed_price)
+        adjustments_made.append(f"Increased budget to ${relaxed_price:.2f}")
+        if results:
+            return {
+                "results": results,
+                "adjustments_made": adjustments_made,
+                "original_constraints": original_constraints,
+                "retry_count": retry_count,
+            }
+    
+    # Attempt 4: Remove all constraints
+    retry_count += 1
+    results = search_listings(description, None, None)
+    adjustments_made.append("Removed all constraints")
+    
+    return {
+        "results": results,
+        "adjustments_made": adjustments_made,
+        "original_constraints": original_constraints,
+        "retry_count": retry_count,
+    }

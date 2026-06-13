@@ -81,9 +81,48 @@ A non-empty string (2–4 sentences) formatted as a casual OOTD caption:
 If outfit string is empty or whitespace-only, return a text-only fallback: "[Item Title] from [Platform] — $[Price]. [Condition]. Add to fit." Do not raise an exception. Log which field was missing for debugging.
 ---
 
-### Additional Tools (if any)
+### Tool 4: price_comparison
 
-<!-- Copy the block above for any tools beyond the required three -->
+**What it does:**
+Analyzes whether a thrifted item's price is fair by comparing it against similar items in the dataset. Returns a price fairness assessment with reasoning and a suggested price range.
+
+**Input parameters:**
+- `item` (dict): A listing dict from search_listings — uses price, category, condition, and style_tags
+- `listings` (list[dict]): The full or filtered listings dataset to compare against (optional; defaults to all listings)
+
+**What it returns:**
+A dict containing:
+- `fairness_rating` (str): One of "great_deal", "fair_price", "overpriced"
+- `reasoning` (str): 1–2 sentence explanation comparing to similar items
+- `comparable_items_count` (int): Number of similar items used for comparison
+- `price_range_low` (float): Estimated low end for this category/condition
+- `price_range_high` (float): Estimated high end for this category/condition
+
+**What happens if it fails or returns nothing:**
+If no comparable items exist (e.g., single item in category), return a neutral assessment with empty `reasoning` and count = 0. Never raise an exception.
+
+---
+
+### Tool 5: retry_search_with_fallback
+
+**What it does:**
+Wraps search_listings with intelligent retry logic. If the initial search returns no results, automatically removes constraints (size filter, then price tolerance) and retries, informing the user what was adjusted.
+
+**Input parameters:**
+- `description` (str): The description of the item
+- `size` (str | None): Desired clothing size
+- `max_price` (float | None): Maximum budget
+- `price_tolerance` (float): Optional buffer (e.g., 0.15 = ±15%) to relax price constraints on retry. Defaults to 0.20 (20%).
+
+**What it returns:**
+A dict containing:
+- `results` (list[dict]): Matching listings (sorted by relevance)
+- `adjustments_made` (list[str]): List of human-readable strings describing what was loosened (e.g., ["Removed size filter", "Increased budget to $35"])
+- `original_constraints` (dict): The original {description, size, max_price} for reference
+- `retry_count` (int): Number of retries performed (0 = found on first try)
+
+**What happens if it fails or returns nothing:**
+If retries exhaust all constraints and still return no results, set `results = []` and include a final adjustment like "All constraints removed—no results available." The calling agent (run_agent) treats empty results as before.
 
 ---
 
@@ -92,18 +131,26 @@ If outfit string is empty or whitespace-only, return a text-only fallback: "[Ite
 **How does your agent decide which tool to call next?**
 <!-- Describe the logic your planning loop uses. What does it look at? What conditions change its behavior? How does it know when it's done? -->
 
-The planning loop follows a linear sequence, always executing tools in order based on the data available at each step. Errors cause early termination.
+The planning loop follows a mostly linear sequence, with intelligent retry logic on search failure. The loop always attempts to find items, retrying with loosened constraints before giving up.
 
 **Sequence:**
 1. **Parse query** — Extract description, size, max_price from user input
-2. **Call search_listings** — Pass parsed values, get list of matches sorted by relevance
-3. **Check results** — If empty, set error and return. If results exist, continue.
+2. **Call retry_search_with_fallback** — Pass parsed values with auto-retry on empty results
+   - First attempt uses original constraints
+   - If empty: automatically remove size filter and retry
+   - If still empty: relax price constraint (±20% buffer) and retry again
+   - If still empty: remove all constraints and retry once more
+   - Returns results + list of adjustments made (if any)
+3. **Check results** — If still empty after all retries, set error and return. If results exist, continue.
 4. **Select top 1** — Store the highest-ranked listing in session["selected_item"]
-5. **Call suggest_outfit** — Pass the top item + wardrobe, get outfit suggestion string
-6. **Call create_fit_card** — Pass outfit suggestion + item, get fit card caption
-7. **Return session** — All fields populated; ready for UI display
+5. **Call price_comparison** — Optional: assess whether the top item's price is fair relative to similar listings
+   - Stores fairness assessment in session["price_assessment"]
+   - Does not block subsequent steps
+6. **Call suggest_outfit** — Pass the top item + wardrobe, get outfit suggestion string
+7. **Call create_fit_card** — Pass outfit suggestion + item, get fit card caption
+8. **Return session** — All fields populated; ready for UI display
 
-The agent halts immediately if search_listings returns no results or if any tool raises an exception (which should not happen if error handling is correct). Otherwise, it completes all 4 tool calls in sequence and returns the populated session.
+The agent halts immediately if search returns no results (even after retries) or if any tool raises an exception. Otherwise, it completes all tool calls in sequence and returns the populated session.
 
 ---
 
@@ -119,9 +166,11 @@ The agent uses a single **session dict** as the central state store for one user
 session = {
     "query": str,                    # Original user query (immutable)
     "parsed": dict,                  # Extracted {description, size, max_price}
-    "search_results": list[dict],    # All matching listings from search_listings
+    "search_results": list[dict],    # All matching listings from retry_search_with_fallback
+    "search_adjustments": list[str], # Constraints loosened during retry (if any)
     "selected_item": dict | None,    # Top 1 result, passed to suggest_outfit
     "wardrobe": dict,                # User's wardrobe (items list)
+    "price_assessment": dict | None, # Output from price_comparison (fairness rating, reasoning, price range)
     "outfit_suggestion": str | None, # Output from suggest_outfit
     "fit_card": str | None,          # Output from create_fit_card
     "error": str | None,             # Set if interaction halts early
@@ -135,19 +184,25 @@ session = {
    - Parse description, size, max_price from query
    - Output: Populate `session["parsed"]` with extracted values
 
-2. **Search Listings → Session:**
+2. **Search with Retry Fallback → Session:**
    - Input: `session["parsed"]` fields (description, size, max_price)
-   - Call `search_listings(description, size, max_price)`
-   - Output: Store results in `session["search_results"]`
-   - If empty: Set `session["error"]` and return early
+   - Call `retry_search_with_fallback(description, size, max_price)`
+   - Output: Store results in `session["search_results"]` and adjustments in `session["search_adjustments"]`
+   - If empty after all retries: Set `session["error"]` and return early
 
-3. **Select Top Result → Suggest Outfit:**
+3. **Price Comparison (optional, non-blocking):**
+   - Input: `session["search_results"][0]` (top match)
+   - Call `price_comparison(top_item, all_listings)`
+   - Output: Store fairness assessment in `session["price_assessment"]`
+   - If fails or has no comparables: Set to `None`; continue regardless
+
+4. **Select Top Result → Suggest Outfit:**
    - Input: `session["search_results"][0]` (top match) + `session["wardrobe"]`
    - Store in `session["selected_item"] = search_results[0]`
    - Call `suggest_outfit(session["selected_item"], session["wardrobe"])`
    - Output: Store result in `session["outfit_suggestion"]`
 
-4. **Create Fit Card:**
+5. **Create Fit Card:**
    - Input: `session["outfit_suggestion"]` + `session["selected_item"]`
    - Call `create_fit_card(session["outfit_suggestion"], session["selected_item"])`
    - Output: Store result in `session["fit_card"]`
@@ -164,9 +219,11 @@ For each tool, describe the specific failure mode you're handling and what the a
 
 | Tool | Failure mode | Agent response |
 |------|-------------|----------------|
-| search_listings | No results match the query | Set `session["error"]` to: "No items found for '[description]' under ${max_price}. Try increasing your budget, removing size filters, or using different keywords (e.g., 'tee' instead of 't-shirt')." Then halt and return. |
+| retry_search_with_fallback | No results after all retries | Set `session["error"]` to: "No items found. Tried removing size filter and increasing budget but still no matches. Try very different keywords or check back later." Then halt and return. |
+| search_listings (direct call if used) | No results match the query | Set `session["error"]` to: "No items found for '[description]' under ${max_price}. Try increasing your budget, removing size filters, or using different keywords." Then halt and return. |
+| price_comparison | No comparable items or calculation error | Set `session["price_assessment"] = None` and log the failure. Continue to next tool (non-blocking). |
 | suggest_outfit | Wardrobe is empty | Skip wardrobe-based matching and call LLM with only the new item's style_tags, colors, and category. Return general styling advice like "This item pairs well with..." or "The vibe is..." Include a prompt: "Add more items to your wardrobe in the app for personalized outfit suggestions." |
-| create_fit_card | Outfit input is missing or whitespace-only | Return a text-only fallback string with just the listing title, price, platform, and condition. Log which field was missing (e.g., "outfit_suggestion was empty"). Do not raise an exception. |
+| create_fit_card | Outfit input is missing or whitespace-only | Return a text-only fallback string with just the listing title, price, platform, and condition. Log which field was missing. Do not raise an exception. |
 
 ---
 
@@ -251,39 +308,10 @@ User
 
 ## AI Tool Plan
 
-### Milestone 1: Setup & Data Verification
-**Goal:** Confirm data loads correctly and Groq API is accessible.
-
-**Steps:**
-1. Run `python utils/data_loader.py` to verify listings and wardrobe schema load without errors
-2. Create `.env` file with valid `GROQ_API_KEY`
-3. Test Groq client initialization: Create a small script that calls `_get_groq_client()` and makes a test LLM call
-4. Inspect 2-3 listings from `data/listings.json` and 2-3 wardrobe items from wardrobe schema to understand field structure
-
-**Success criteria:** Data loads, Groq API responds, no errors in test calls.
-
----
-
-### Milestone 2: Understand Data Structures
-**Goal:** Internalize the listing and wardrobe formats before implementation.
-
-**Steps:**
-1. Review the Listing dict structure (id, title, description, category, style_tags, size, condition, price, colors, brand, platform)
-2. Review the Wardrobe item structure (id, name, category, colors, style_tags, notes)
-3. Write 3 test queries exploring different keyword types:
-   - Query 1: "vintage graphic tee" → Look for listing with those tags
-   - Query 2: "size M" → Check size matching logic ("M" should match "S/M")
-   - Query 3: "under $50" → Verify price filtering
-4. Manually inspect which listings should match each query
-
-**Success criteria:** Understand which fields are most relevant for search, style matching, and caption generation.
-
----
-
 ### Milestone 3: Individual Tool Implementations
 
 #### Tool 1: search_listings()
-**AI Tool:** Claude (GitHub Copilot)
+**AI Tool:** Claude
 
 **Input to Claude:**
 - Tool 1 spec from this planning.md (What it does, Input parameters, What it returns, Failure handling)
@@ -301,7 +329,7 @@ User
 ---
 
 #### Tool 2: suggest_outfit()
-**AI Tool:** Claude (GitHub Copilot)
+**AI Tool:** Claude
 
 **Input to Claude:**
 - Tool 2 spec from this planning.md
@@ -318,7 +346,7 @@ User
 ---
 
 #### Tool 3: create_fit_card()
-**AI Tool:** Claude (GitHub Copilot)
+**AI Tool:** Claude
 
 **Input to Claude:**
 - Tool 3 spec from this planning.md
@@ -337,7 +365,7 @@ User
 ### Milestone 4: Planning Loop & Integration
 
 #### parse_query() (agent.py)
-**AI Tool:** Claude (GitHub Copilot)
+**AI Tool:** Claude
 
 **Input to Claude:**
 - Example queries: "vintage graphic tee under $30, size M", "black boots", "$50 white sneakers"
@@ -349,7 +377,7 @@ User
 ---
 
 #### run_agent() (agent.py)
-**AI Tool:** Claude (GitHub Copilot)
+**AI Tool:** Claude
 
 **Input to Claude:**
 - The planning loop description from this planning.md
@@ -363,7 +391,7 @@ User
 ---
 
 #### handle_query() (app.py)
-**AI Tool:** Claude (GitHub Copilot)
+**AI Tool:** Claude
 
 **Input to Claude:**
 - app.py skeleton with TODO comments

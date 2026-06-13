@@ -57,6 +57,8 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
         return session["error"], "", ""
     
     item = session["selected_item"]
+    
+    # Start building the listing text
     listing_text = f"""**{item.get('title', 'Item')}**
 
 **Price:** ${item.get('price', 'N/A')}
@@ -71,6 +73,20 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
 
 **Description:** {item.get('description', 'No description available')}
 """
+    
+    # Add price assessment if available
+    if session.get("price_assessment"):
+        assessment = session["price_assessment"]
+        fairness = assessment.get("fairness_rating", "fair_price").replace("_", " ").title()
+        reasoning = assessment.get("reasoning", "")
+        if reasoning:
+            listing_text += f"\n---\n\n**Price Assessment:** {fairness}\n\n{reasoning}"
+    
+    # Add search adjustments if any were made
+    if session.get("search_adjustments"):
+        adjustments = session["search_adjustments"]
+        adjustments_text = ", ".join(adjustments)
+        listing_text += f"\n\n*Note: Search was adjusted. {adjustments_text}.*"
     
     return listing_text, session["outfit_suggestion"], session["fit_card"]
 

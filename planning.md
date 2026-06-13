@@ -231,68 +231,39 @@ For each tool, describe the specific failure mode you're handling and what the a
 
 The agent architecture is organized into three layers: **Interface** (user-facing), **Planning Loop** (orchestration), and **Tools** (execution). State flows through a central session dict.
 
-User query
-    │
-    ▼
-app.py — handle_query()
-    │
-    ▼
-agent.py — run_agent()
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Planning Loop                                               │
-│                                                             │
-│  Step 1 — Parse input                                       │
-│      Extract: description, size, max_price, wardrobe        │
-│          │                                                  │
-│          ├── max_price missing? ──► set session["error"]    │
-│          │                         return early             │
-│          │                                                  │
-│          ▼                                                  │
-│      session: query_params, wardrobe_context saved          │
-│          │                                                  │
-│  Step 2 — search_listings(description, size, max_price)     │
-│          │                                                  │
-│          ▼                                                  │
-│      results = [...]                                        │
-│          │                                                  │
-│          ├── results == [] ──► set session["error"]         │
-│          │                    return early                  │
-│          │                                                  │
-│          ▼                                                  │
-│      session: listings_results = results                    │
-│      session: selected_item = results[0]                    │
-│          │                                                  │
-│  Step 3 — suggest_outfit(selected_item, wardrobe)           │
-│          │                                                  │
-│          ├── wardrobe.items == [] ──► generic tips fallback │
-│          │                           (never blocks step 4)  │
-│          │                                                  │
-│          ▼                                                  │
-│      session: outfit_data = { outfit_pieces,                │
-│                               styling_tips, vibe }          │
-│          │                                                  │
-│  Step 4 — create_fit_card(new_item, outfit_data)            │
-│          │                                                  │
-│          ├── outfit missing fields ──► text-only fallback   │
-│          │                            log missing field     │
-│          │                                                  │
-│          ▼                                                  │
-│      session: fit_card saved                                │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼
-Return session → app.py
-    │
-    ▼
-UI display
-    listing panel · outfit panel · fit card panel
-    │
-    ▼
-User
+```mermaid
+---
+config:
+  layout: elk
+---
+flowchart TD
 
+    A([User input]):::indigo --> B["Planning Loop<br/>Parse query → retry_search_with_fallback<br/>→ select top 1 → price_comparison<br/>→ suggest_outfit → create_fit_card"]:::teal
+
+    subgraph Tools_Group["Tools"]
+      direction TB
+      T1([search_listings]):::orange
+      T2([suggest_outfit]):::green
+      T3([create_fit_card]):::violet
+    end
+
+    B --> T1
+    B --> T2
+    B --> T3
+
+    subgraph Session_Group["State / Session"]
+      direction TB
+      S1[["session['selected_item']"]]
+      S2[["session['price_assessment']"]]
+      S3[["session['fit_card']"]]
+    end
+
+    T1 <--> Session_Group
+    T2 <--> Session_Group
+    T3 <--> Session_Group
+
+    Session_Group --> C(["Return updated session<br/>Ready for UI display"]):::indigo
+```
 
 ### Component Responsibilities
 
